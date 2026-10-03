@@ -2944,11 +2944,22 @@ async function handleVirtualModelRequest(
         upstreamResponse.ok &&
         canTreatAsLiveStreamResponse(source, targetProvider, upstreamResponse)
       ) {
+        // Same protocol on both sides (e.g. anthropic_messages -> anthropic_messages):
+        // the upstream stream is already in the client's dialect, so relaying it
+        // through the protocol converter can only lose events the converter does not
+        // model (Anthropic content_block_*) — pipe it verbatim, exactly as the
+        // non-virtual path does before it ever reaches this branch.
+        const passthroughStream = canPassthroughWithoutProtocolConversion(
+          source.adapterKey,
+          sourceAdapter.provider,
+          targetProvider,
+          targetProviderConfig
+        );
         recordGatewayStreamConversion({
           sourceAdapter: source.adapterKey,
           targetProvider,
           targetProviderName: targetProviderConfig?.name,
-          mode: 'live'
+          mode: passthroughStream ? 'passthrough' : 'live'
         });
         if (shouldBlockLiveStreamingForStrictBilling(config)) {
           await cancelResponseBody(upstreamResponse);
@@ -2981,6 +2992,12 @@ async function handleVirtualModelRequest(
           );
         });
         attachTargetRoutingHeaders(reply, targetProvider, targetProviderConfig?.name, attempts.length, targetProviderConfig);
+        if (passthroughStream) {
+          if (shouldForceEventStreamHeaders(source, isStreaming)) {
+            forceEventStreamHeaders(reply);
+          }
+          return relayUpstreamResponse(reply, upstreamResponse, clientAbortSignal);
+        }
         return relayConvertedStreamFromUpstreamResponse(
           reply,
           source,

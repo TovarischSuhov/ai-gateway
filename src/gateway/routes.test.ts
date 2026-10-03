@@ -13245,6 +13245,149 @@ export function createGatewayPlugin() {
       await app.close();
     }
   });
+
+  it('relays an Anthropic-native stream verbatim when a virtual model keeps the protocol', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_native","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Considering"}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-native"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello there"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":7}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const provider = createProviderConfig('anthropic-main', 'anthropic_messages', [
+      'claude-sonnet-4-5-20250929'
+    ]);
+    provider.baseurl = 'https://api.anthropic.com';
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig([provider], undefined, [
+        createFixedAliasProfile(
+          'alias-main',
+          'claude-sonnet-4-5-20250929',
+          'anthropic-main/claude-sonnet-4-5-20250929'
+        )
+      ]),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'claude-sonnet-4-5-20250929',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+
+      const [, upstreamInit] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(JSON.parse(String(upstreamInit.body)).model).toBe('claude-sonnet-4-5-20250929');
+
+      const events = parseJsonSseEvents(response.body);
+      expect(events.map((event) => event.event)).toEqual([
+        'message_start',
+        'content_block_start',
+        'content_block_delta',
+        'content_block_delta',
+        'content_block_stop',
+        'content_block_start',
+        'content_block_delta',
+        'content_block_stop',
+        'message_delta',
+        'message_stop'
+      ]);
+      expect(events[0]?.data.message).toMatchObject({
+        model: 'claude-sonnet-4-5-20250929',
+        content: []
+      });
+      expect(events[2]?.data.delta).toEqual({ type: 'thinking_delta', thinking: 'Considering' });
+      expect(events[3]?.data.delta).toEqual({ type: 'signature_delta', signature: 'sig-native' });
+      expect(events[6]?.data.delta).toEqual({ type: 'text_delta', text: 'Hello there' });
+      expect(events[8]?.data.usage).toMatchObject({ output_tokens: 7 });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('still converts an OpenAI-chat upstream for a virtual model on the Anthropic route', async () => {
+    const fetchMock = vi.fn(async () => {
+      return createSseResponse([
+        'data: {"id":"chatcmpl_virtual_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"role":"assistant"}}]}\n\n',
+        'data: {"id":"chatcmpl_virtual_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{"content":"Hello there"}}]}\n\n',
+        'data: {"id":"chatcmpl_virtual_1","object":"chat.completion.chunk","model":"glm-5","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}\n\n',
+        'data: [DONE]\n\n'
+      ]);
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_chat_completions', ['glm-5'])],
+        undefined,
+        [
+          createFixedAliasProfile(
+            'alias-chat',
+            'claude-haiku-4-5-20251001',
+            'openai-main/glm-5'
+          )
+        ]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/messages',
+        headers: {
+          'content-type': 'application/json',
+          'anthropic-version': '2023-06-01'
+        },
+        payload: {
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 128,
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }]
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+
+      const events = parseJsonSseEvents(response.body);
+      expect(events[0]?.event).toBe('message_start');
+      expect(response.body).toContain('"type":"text_delta","text":"Hello there"');
+      expect(response.body).not.toContain('event: error');
+      expect(response.body.endsWith('event: message_stop\ndata: {"type":"message_stop"}\n\n')).toBe(
+        true
+      );
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 function restoreEnvValue(name: string, value: string | undefined): void {
@@ -13550,6 +13693,40 @@ function createVirtualSuffixProfile(
       mode: 'decorate_only',
       maxTurns: 1,
       maxToolCalls: 0,
+      clientToolsPolicy: 'allow',
+      streamMode: 'buffered'
+    },
+    materialization: {
+      enabled: true,
+      includeInGatewayModels: true
+    }
+  };
+}
+
+function createFixedAliasProfile(
+  key: string,
+  alias: string,
+  fixedModel: string
+): NonNullable<GatewayConfig['virtualModelProfiles']>[number] {
+  return {
+    id: `virtual-${key}`,
+    key,
+    displayName: key,
+    enabled: true,
+    match: {
+      exactAliases: [alias],
+      prefixes: [],
+      suffixes: []
+    },
+    baseModel: {
+      mode: 'fixed',
+      fixedModel
+    },
+    tools: [],
+    execution: {
+      mode: 'tool_loop',
+      maxTurns: 6,
+      maxToolCalls: 8,
       clientToolsPolicy: 'allow',
       streamMode: 'buffered'
     },
