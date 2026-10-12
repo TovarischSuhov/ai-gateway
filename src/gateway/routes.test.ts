@@ -14152,6 +14152,241 @@ export function createGatewayPlugin() {
       await app.close();
     }
   });
+
+  it('terminates a virtual openai_responses passthrough stream on the [DONE] sentinel without waiting for transport EOF (FR-14)', async () => {
+    let canceled = false;
+    const fetchMock = vi.fn(async () => {
+      return createOpenEndedSseResponse(
+        [
+          'event: response.created\n' +
+            'data: {"type":"response.created","response":{"id":"resp_virtual_open_transport","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n',
+          'event: response.completed\n' +
+            'data: {"type":"response.completed","response":{"id":"resp_virtual_open_transport","object":"response","status":"completed","model":"gpt-5.5","output":[{"id":"msg_virtual_open_transport","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"all good"}]}]}}\n\n',
+          'data: [DONE]\n\n',
+          'event: response.output_text.delta\n' +
+            'data: {"type":"response.output_text.delta","item_id":"msg_open_transport","output_index":0,"content_index":0,"delta":"tail-drop-marker"}\n\n'
+        ],
+        () => {
+          canceled = true;
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.5'])],
+        undefined,
+        [createFixedAliasProfile('alias-resp', 'gpt-5.5-virtual', 'openai-main/gpt-5.5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      // The upstream never closes the transport, so if the terminator did not act on
+      // the logical terminal this await would hang until the test times out.
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          accept: 'text/event-stream',
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'gpt-5.5-virtual',
+          input: 'hello native stream',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('"type":"response.completed"');
+      expect(response.body).toContain('data: [DONE]');
+      // The [DONE] sentinel is the logical terminal: the transport is canceled instead
+      // of being drained to EOF, so the trailing frame past it is never relayed
+      // (FR-5 analog for the responses arm).
+      expect(response.body).not.toContain('tail-drop-marker');
+      const upstreamCanceled = await waitForCondition(() => canceled).then(
+        () => true,
+        () => false
+      );
+      expect(
+        upstreamCanceled,
+        'the upstream virtual openai_responses body should be canceled once [DONE] is relayed'
+      ).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('terminates a virtual openai_responses passthrough stream when the [DONE] sentinel is split across chunk boundaries and drops the tail (FR-15)', async () => {
+    const createdFrame =
+      'event: response.created\n' +
+      'data: {"type":"response.created","response":{"id":"resp_virtual_split_completed","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n';
+    const completedFrame =
+      'event: response.completed\n' +
+      'data: {"type":"response.completed","response":{"id":"resp_virtual_split_completed","object":"response","status":"completed","model":"gpt-5.5","output":[]}}\n\n';
+    const doneFrame = 'data: [DONE]\n\n';
+    const trailingFrame =
+      'event: response.output_text.delta\n' +
+      'data: {"type":"response.output_text.delta","item_id":"msg_tail","output_index":0,"content_index":0,"delta":"tail-drop-marker"}\n\n';
+
+    // Both split layouts keep the transport open (createOpenEndedSseResponse never
+    // closes), so the chain can only finish if the block reassembly survives the
+    // fragmenting and the terminator acts on the reassembled logical terminal. A
+    // closed stream here would make the test vacuous: a plain verbatim relay would
+    // still fail (the transport stays open), but the reassembly itself would be
+    // untested.
+    const variants: Array<{ label: string; chunks: string[] }> = [
+      {
+        label: 'delimiter split',
+        chunks: [createdFrame, completedFrame, doneFrame.slice(0, -2), '\n\n', trailingFrame]
+      },
+      {
+        label: 'payload split',
+        chunks: [createdFrame, completedFrame, doneFrame.slice(0, 6), doneFrame.slice(6), trailingFrame]
+      }
+    ];
+
+    for (const variant of variants) {
+      let canceled = false;
+      const fetchMock = vi.fn(async () => {
+        return createOpenEndedSseResponse(variant.chunks, () => {
+          canceled = true;
+        });
+      });
+      vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+      const app = Fastify({ logger: false });
+      registerGatewayRoutes(
+        app,
+        createConfig(
+          [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.5'])],
+          undefined,
+          [createFixedAliasProfile('alias-resp', 'gpt-5.5-virtual', 'openai-main/gpt-5.5')]
+        ),
+        createGatewayRuntime()
+      );
+      await app.ready();
+
+      try {
+        const response = await app.inject({
+          method: 'POST',
+          url: '/v1/responses',
+          headers: {
+            accept: 'text/event-stream',
+            'content-type': 'application/json'
+          },
+          payload: {
+            model: 'gpt-5.5-virtual',
+            input: `hello native stream (${variant.label})`,
+            stream: true
+          }
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(
+          response.body.match(/"type":"response\.completed"/g) ?? [],
+          `${variant.label}: exactly the reassembled logical terminal is relayed`
+        ).toHaveLength(1);
+        // The terminator closes at the logical terminal: the reassembled upstream
+        // [DONE] is relayed exactly once and the trailing frame past it is dropped,
+        // not relayed (FR-5 analog).
+        expect(
+          response.body.match(/data: \[DONE\]/g) ?? [],
+          `${variant.label}: the split [DONE] sentinel is reassembled and relayed exactly once`
+        ).toHaveLength(1);
+        expect(response.body, `${variant.label}: tail past the terminal is dropped`).not.toContain(
+          'tail-drop-marker'
+        );
+        const upstreamCanceled = await waitForCondition(() => canceled).then(
+          () => true,
+          () => false
+        );
+        expect(
+          upstreamCanceled,
+          `${variant.label}: the upstream body should be canceled once [DONE] is relayed`
+        ).toBe(true);
+      } finally {
+        await app.close();
+      }
+    }
+  });
+
+  it('ends a virtual openai_responses passthrough stream after an upstream error frame and [DONE] on an open transport without surfacing an unhandled rejection (FR-16)', async () => {
+    let canceled = false;
+    const fetchMock = vi.fn(async () => {
+      return createOpenEndedSseResponse(
+        [
+          'event: response.created\n' +
+            'data: {"type":"response.created","response":{"id":"resp_virtual_error_done","object":"response","status":"in_progress","model":"gpt-5.5","output":[]}}\n\n',
+          'event: error\n' +
+            'data: {"code":"context_too_large","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","sequence_number":0,"type":"error"}\n\n',
+          'data: [DONE]\n\n',
+          'event: response.output_text.delta\n' +
+            'data: {"type":"response.output_text.delta","item_id":"msg_error_done","output_index":0,"content_index":0,"delta":"tail-drop-marker"}\n\n'
+        ],
+        () => {
+          canceled = true;
+        }
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock as typeof fetch);
+
+    const app = Fastify({ logger: false });
+    registerGatewayRoutes(
+      app,
+      createConfig(
+        [createProviderConfig('openai-main', 'openai_responses', ['gpt-5.5'])],
+        undefined,
+        [createFixedAliasProfile('alias-resp', 'gpt-5.5-virtual', 'openai-main/gpt-5.5')]
+      ),
+      createGatewayRuntime()
+    );
+    await app.ready();
+
+    try {
+      // The synthetic completion is flushed by the normalization when [DONE] is
+      // relayed (an error frame was seen first), then the [DONE] terminator ends the
+      // stream and cancels the normalization pump mid-read. Without a cancellation
+      // guard the pump resumed on the canceled controller and threw an unhandled
+      // rejection, which terminates the whole process on Node >= 20.
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        headers: {
+          accept: 'text/event-stream',
+          'content-type': 'application/json'
+        },
+        payload: {
+          model: 'gpt-5.5-virtual',
+          input: 'trigger an upstream context_too_large error',
+          stream: true
+        }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('"type":"response.completed"');
+      expect(response.body).toContain('Upstream error context_too_large:');
+      expect(response.body).toContain('data: [DONE]');
+      expect(response.body).not.toContain('event: error');
+      expect(response.body).not.toContain('tail-drop-marker');
+      const upstreamCanceled = await waitForCondition(() => canceled).then(
+        () => true,
+        () => false
+      );
+      expect(
+        upstreamCanceled,
+        'the upstream body should be canceled once [DONE] is relayed'
+      ).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
 });
 
 function restoreEnvValue(name: string, value: string | undefined): void {

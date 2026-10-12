@@ -3025,11 +3025,20 @@ async function handleVirtualModelRequest(
           if (shouldForceEventStreamHeaders(source, isStreaming)) {
             forceEventStreamHeaders(reply);
           }
-          const relayResponse = terminateOpenAIChatStreamOnDone({
-            source,
-            targetProvider,
-            response: billingStreamResponse
-          });
+          const relayResponse =
+            source.adapterKey === 'openai_responses' &&
+            targetProviderConfig?.type === 'openai_responses'
+              ? terminateOpenAIResponsesPassthroughOnDone({
+                  source,
+                  targetProvider,
+                  targetProviderConfig,
+                  response: billingStreamResponse
+                })
+              : terminateOpenAIChatStreamOnDone({
+                  source,
+                  targetProvider,
+                  response: billingStreamResponse
+                });
           return relayUpstreamResponse(reply, relayResponse, clientAbortSignal);
         }
         return relayConvertedStreamFromUpstreamResponse(
@@ -10360,6 +10369,7 @@ interface OpenAIResponsesPassthroughStreamError {
 }
 
 interface OpenAIResponsesPassthroughStreamState {
+  canceled: boolean;
   completed: boolean;
   done: boolean;
   error?: OpenAIResponsesPassthroughStreamError;
@@ -10391,6 +10401,7 @@ function normalizeOpenAIResponsesPassthroughStreamTermination(input: {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const state: OpenAIResponsesPassthroughStreamState = {
+    canceled: false,
     completed: false,
     done: false,
     outputItems: [],
@@ -10404,6 +10415,7 @@ function normalizeOpenAIResponsesPassthroughStreamTermination(input: {
       void pumpOpenAIResponsesPassthroughStream(reader, decoder, encoder, controller, state);
     },
     cancel(reason) {
+      state.canceled = true;
       return reader.cancel(reason);
     }
   });
@@ -10431,6 +10443,13 @@ async function pumpOpenAIResponsesPassthroughStream(
       processOpenAIResponsesPassthroughSseText(decoder.decode(chunk.value, { stream: true }), encoder, controller, state);
     }
 
+    if (state.canceled) {
+      // The stream was canceled mid-flight (a downstream terminator acting on the
+      // already-relayed `[DONE]`, or a client disconnect): the controller is closed,
+      // so flushing or closing it here would throw on this void-pumped promise and
+      // surface as an unhandled rejection.
+      return;
+    }
     const remaining = decoder.decode();
     if (remaining) {
       processOpenAIResponsesPassthroughSseText(remaining, encoder, controller, state);
@@ -10442,6 +10461,9 @@ async function pumpOpenAIResponsesPassthroughStream(
     }
     controller.close();
   } catch (error) {
+    if (state.canceled) {
+      return;
+    }
     if (state.error && !state.completed) {
       appendOpenAIResponsesSyntheticErrorCompletionIfNeeded(encoder, controller, state);
       if (state.syntheticCompletionSent && !state.done) {
@@ -10681,27 +10703,17 @@ function appendOpenAIResponsesSyntheticErrorCompletionIfNeeded(
   controller.enqueue(encoder.encode(`event: response.completed\ndata: ${payload}\n\n`));
 }
 
-// An openai_chat passthrough stream is relayed verbatim, but the upstream may send
-// the closing `data: [DONE]` sentinel and then keep the transport open. Relaying to
-// transport EOF would leave the gateway request hanging, so this wrapper ends the
-// downstream as soon as the sentinel is seen and cancels the upstream body without
-// waiting for it. The relay is pull-based: the upstream reader is driven only as the
-// downstream consumes, so a stalled client applies backpressure instead of buffering
-// the whole response in memory, and the per-pull buffer is capped so a non-conformant
-// upstream that never delimits a block cannot be drained into memory either. It is
-// self-gating: any other protocol (Anthropic, Gemini, responses — the latter already
-// normalized upstream) is returned untouched.
-function terminateOpenAIChatStreamOnDone(input: {
-  source: GatewaySourceContext;
-  targetProvider: Provider;
+// Shared pull-based terminator for same-protocol passthrough streams: SSE blocks are
+// relayed verbatim and the downstream ends after the first block matching
+// isSentinelBlock, canceling the upstream body instead of waiting for transport EOF.
+// Abrupt EOF is relayed verbatim — no terminator is ever synthesized here (FR-4).
+// The relay is pull-based (see the pump below): a stalled client applies backpressure
+// instead of buffering the whole response in memory.
+function terminateEventStreamOnSentinel(input: {
   response: Response;
+  isSentinelBlock: (block: string) => boolean;
 }): Response {
-  if (
-    input.source.adapterKey !== 'openai_chat' ||
-    input.targetProvider !== 'openai' ||
-    !input.response.body ||
-    !isEventStreamResponse(input.response)
-  ) {
+  if (!input.response.body || !isEventStreamResponse(input.response)) {
     return input.response;
   }
 
@@ -10719,8 +10731,8 @@ function terminateOpenAIChatStreamOnDone(input: {
   };
 
   // Emits every complete SSE block already buffered, in order, verbatim. Returns true
-  // once at least one block has been emitted for this pull (a full block, or the
-  // `[DONE]` sentinel — in which case the sentinel frame is emitted, the upstream body
+  // once at least one block has been emitted for this pull (a full block, or a
+  // sentinel — in which case the sentinel frame is emitted, the upstream body
   // is canceled idempotently, and the downstream closes, dropping any trailing frames
   // without waiting for transport EOF, FR-5). Returns false when only a partial block
   // is buffered.
@@ -10734,7 +10746,7 @@ function terminateOpenAIChatStreamOnDone(input: {
       const block = pending.slice(0, delimiter.index);
       const rawBlock = pending.slice(0, delimiter.index + delimiter.length);
       pending = pending.slice(delimiter.index + delimiter.length);
-      if (parseSseBlock(block).data === '[DONE]') {
+      if (input.isSentinelBlock(block)) {
         controller.enqueue(encoder.encode(rawBlock));
         void cancelReader();
         controller.close();
@@ -10750,9 +10762,11 @@ function terminateOpenAIChatStreamOnDone(input: {
   // without a bound a single `pull` would read the whole — possibly endless — body into
   // `pending`, the very eager read this pull-based pump exists to avoid. Past the cap
   // the flushable prefix is relayed verbatim and only a small tail is retained: enough
-  // to reassemble a delimiter or a split `data: [DONE]` (`[DONE]` is 12 chars, the
+  // to reassemble a delimiter or a split sentinel frame (`[DONE]` is 12 chars, the
   // longest delimiter 4), well below the cap, so any conformant block that fits under
-  // the cap is never split.
+  // the cap is never split. A terminal block larger than the cap stays byte-exact but
+  // no longer parses as a whole block, so its termination degrades to transport EOF —
+  // the relayed bytes are still correct, only the early upstream cancel is lost.
   const maxBufferedChars = 262_144;
   const retainedTailChars = 64;
   const flushOverflowedPending = (controller: ReadableStreamDefaultController<Uint8Array>): boolean => {
@@ -10788,7 +10802,7 @@ function terminateOpenAIChatStreamOnDone(input: {
           const chunk = await reader.read();
           if (chunk.done) {
             // Abrupt EOF: flush the decoder remainder and any partial block verbatim.
-            // Never synthesize a `[DONE]` sentinel here (FR-4).
+            // Never synthesize a terminator here (FR-4).
             pending += decoder.decode();
             if (pending) {
               controller.enqueue(encoder.encode(pending));
@@ -10811,6 +10825,44 @@ function terminateOpenAIChatStreamOnDone(input: {
     status: input.response.status,
     statusText: input.response.statusText,
     headers: input.response.headers
+  });
+}
+
+function terminateOpenAIChatStreamOnDone(input: {
+  source: GatewaySourceContext;
+  targetProvider: Provider;
+  response: Response;
+}): Response {
+  if (input.source.adapterKey !== 'openai_chat' || input.targetProvider !== 'openai') {
+    return input.response;
+  }
+
+  return terminateEventStreamOnSentinel({
+    response: input.response,
+    isSentinelBlock: (block) => parseSseBlock(block).data === '[DONE]'
+  });
+}
+
+function terminateOpenAIResponsesPassthroughOnDone(input: {
+  source: GatewaySourceContext;
+  targetProvider: Provider;
+  targetProviderConfig?: ProviderConfig;
+  response: Response;
+}): Response {
+  if (
+    input.source.adapterKey !== 'openai_responses' ||
+    input.targetProvider !== 'openai' ||
+    input.targetProviderConfig?.type !== 'openai_responses'
+  ) {
+    return input.response;
+  }
+
+  return terminateEventStreamOnSentinel({
+    response: input.response,
+    // Mirror normalizeOpenAIResponsesPassthroughStreamTermination: the logical
+    // terminal of a clean Responses passthrough stream is the `[DONE]` sentinel —
+    // relay it, then end (`response.completed` alone is not the terminal).
+    isSentinelBlock: (block) => parseSseBlock(block).data === '[DONE]'
   });
 }
 
