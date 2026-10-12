@@ -2965,7 +2965,36 @@ async function handleVirtualModelRequest(
           await cancelResponseBody(upstreamResponse);
           return sendBadRequest(reply, strictBillingLiveStreamingUnsupportedMessage);
         }
-        const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, upstreamResponse);
+        // Mirror the non-virtual passthrough ordering (normalize -> clone -> relay):
+        // an openai_responses passthrough stream is terminated before any consumer
+        // sees it, so the raw-trace clone and billing clone both observe the
+        // normalized stream. For openai_chat (and every other protocol) this is the
+        // raw upstream response.
+        const billingStreamResponse =
+          passthroughStream && source.adapterKey === 'openai_responses' && targetProvider === 'openai'
+            ? normalizeOpenAIResponsesPassthroughStreamTermination({
+                source,
+                targetProvider,
+                targetProviderConfig,
+                model,
+                response: upstreamResponse
+              })
+            : upstreamResponse;
+        const rawTraceStreamResponse = cloneResponseForRawStreamTrace(config, billingStreamResponse);
+        // Only tee the stream via clone() when the billing/raw-trace helper will
+        // actually consume it — it early-returns otherwise (see the guard at the
+        // top of tryPublishStreamingBillingEventFromUpstreamResponse). An unread
+        // tee branch keeps the upstream body from ever being canceled, which would
+        // stall terminateOpenAIChatStreamOnDone's cancel on [DONE]/client abort.
+        // When the clone is taken, that clone() tees the body: the upstream source
+        // is canceled only once both branches are canceled, so the terminator's
+        // reader.cancel() on the relay branch does not cancel the upstream while the
+        // billing/raw-trace branch is still being read — the connection and the
+        // background billing/raw-trace promise stay open until transport EOF. Not a
+        // regression (the pre-terminator relay held the upstream the same way), and
+        // the client now closes correctly on `data: [DONE]`; the residual upstream
+        // hold is accepted knowingly.
+        const shouldCloneForBilling = config.billing.enabled || config.rawTrace.enabled;
         void tryPublishStreamingBillingEventFromUpstreamResponse(
           request,
           reply,
@@ -2977,7 +3006,7 @@ async function handleVirtualModelRequest(
           lastAttemptSequence,
           targetAdapter,
           upstreamRequest,
-          upstreamResponse.clone(),
+          shouldCloneForBilling ? billingStreamResponse.clone() : billingStreamResponse,
           model,
           targetProviderConfig,
           rawTraceStreamResponse,
@@ -2996,7 +3025,12 @@ async function handleVirtualModelRequest(
           if (shouldForceEventStreamHeaders(source, isStreaming)) {
             forceEventStreamHeaders(reply);
           }
-          return relayUpstreamResponse(reply, upstreamResponse, clientAbortSignal);
+          const relayResponse = terminateOpenAIChatStreamOnDone({
+            source,
+            targetProvider,
+            response: billingStreamResponse
+          });
+          return relayUpstreamResponse(reply, relayResponse, clientAbortSignal);
         }
         return relayConvertedStreamFromUpstreamResponse(
           reply,
@@ -10645,6 +10679,139 @@ function appendOpenAIResponsesSyntheticErrorCompletionIfNeeded(
     response
   });
   controller.enqueue(encoder.encode(`event: response.completed\ndata: ${payload}\n\n`));
+}
+
+// An openai_chat passthrough stream is relayed verbatim, but the upstream may send
+// the closing `data: [DONE]` sentinel and then keep the transport open. Relaying to
+// transport EOF would leave the gateway request hanging, so this wrapper ends the
+// downstream as soon as the sentinel is seen and cancels the upstream body without
+// waiting for it. The relay is pull-based: the upstream reader is driven only as the
+// downstream consumes, so a stalled client applies backpressure instead of buffering
+// the whole response in memory, and the per-pull buffer is capped so a non-conformant
+// upstream that never delimits a block cannot be drained into memory either. It is
+// self-gating: any other protocol (Anthropic, Gemini, responses — the latter already
+// normalized upstream) is returned untouched.
+function terminateOpenAIChatStreamOnDone(input: {
+  source: GatewaySourceContext;
+  targetProvider: Provider;
+  response: Response;
+}): Response {
+  if (
+    input.source.adapterKey !== 'openai_chat' ||
+    input.targetProvider !== 'openai' ||
+    !input.response.body ||
+    !isEventStreamResponse(input.response)
+  ) {
+    return input.response;
+  }
+
+  const reader = input.response.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let pending = '';
+  let settled = false;
+  const cancelReader = (reason?: unknown): Promise<void> => {
+    if (settled) {
+      return Promise.resolve();
+    }
+    settled = true;
+    return reader.cancel(reason).catch(() => undefined);
+  };
+
+  // Emits every complete SSE block already buffered, in order, verbatim. Returns true
+  // once at least one block has been emitted for this pull (a full block, or the
+  // `[DONE]` sentinel — in which case the sentinel frame is emitted, the upstream body
+  // is canceled idempotently, and the downstream closes, dropping any trailing frames
+  // without waiting for transport EOF, FR-5). Returns false when only a partial block
+  // is buffered.
+  const emitBufferedBlocks = (controller: ReadableStreamDefaultController<Uint8Array>): boolean => {
+    let emitted = false;
+    while (true) {
+      const delimiter = findSseBlockDelimiter(pending);
+      if (!delimiter) {
+        return emitted;
+      }
+      const block = pending.slice(0, delimiter.index);
+      const rawBlock = pending.slice(0, delimiter.index + delimiter.length);
+      pending = pending.slice(delimiter.index + delimiter.length);
+      if (parseSseBlock(block).data === '[DONE]') {
+        controller.enqueue(encoder.encode(rawBlock));
+        void cancelReader();
+        controller.close();
+        return true;
+      }
+      controller.enqueue(encoder.encode(rawBlock));
+      emitted = true;
+    }
+  };
+
+  // A conformant SSE stream delimits every block, so the buffer above drains as soon
+  // as a block completes. A non-conformant upstream may never emit a delimiter at all:
+  // without a bound a single `pull` would read the whole — possibly endless — body into
+  // `pending`, the very eager read this pull-based pump exists to avoid. Past the cap
+  // the flushable prefix is relayed verbatim and only a small tail is retained: enough
+  // to reassemble a delimiter or a split `data: [DONE]` (`[DONE]` is 12 chars, the
+  // longest delimiter 4), well below the cap, so any conformant block that fits under
+  // the cap is never split.
+  const maxBufferedChars = 262_144;
+  const retainedTailChars = 64;
+  const flushOverflowedPending = (controller: ReadableStreamDefaultController<Uint8Array>): boolean => {
+    if (pending.length <= maxBufferedChars) {
+      return false;
+    }
+    let cut = pending.length - retainedTailChars;
+    const preceding = pending.charCodeAt(cut - 1);
+    if (preceding >= 0xd800 && preceding <= 0xdbff) {
+      // Keep a surrogate pair whole so the verbatim replay stays exact.
+      cut -= 1;
+    }
+    controller.enqueue(encoder.encode(pending.slice(0, cut)));
+    pending = pending.slice(cut);
+    return true;
+  };
+
+  const stream = new ReadableStream<Uint8Array>({
+    // Pull-based pump: with the default queuing strategy the downstream's outstanding
+    // demand drives every `pull`, so a stalled client applies backpressure instead of
+    // letting the whole upstream body accumulate in the controller queue. One `pull`
+    // drains every block already buffered (stopping once at least one is emitted) and,
+    // while no complete block is buffered, keeps reading one upstream chunk at a time
+    // so a block split across chunk boundaries never stalls the stream. It stops as
+    // soon as it can emit — or once the buffer overflows — so no more than a single
+    // block (or the cap) is ever read ahead of the downstream's demand.
+    async pull(controller) {
+      try {
+        while (!emitBufferedBlocks(controller)) {
+          if (flushOverflowedPending(controller)) {
+            return;
+          }
+          const chunk = await reader.read();
+          if (chunk.done) {
+            // Abrupt EOF: flush the decoder remainder and any partial block verbatim.
+            // Never synthesize a `[DONE]` sentinel here (FR-4).
+            pending += decoder.decode();
+            if (pending) {
+              controller.enqueue(encoder.encode(pending));
+            }
+            controller.close();
+            return;
+          }
+          pending += decoder.decode(chunk.value, { stream: true });
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return cancelReader(reason);
+    }
+  });
+
+  return new Response(stream, {
+    status: input.response.status,
+    statusText: input.response.statusText,
+    headers: input.response.headers
+  });
 }
 
 async function normalizeOpenAIPayloadForResponseParseRecovery(
